@@ -16,7 +16,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Копируем код приложения
-COPY bot.py .
+COPY yoga_bot.py .
 
 # Создаем директорию для логов
 RUN mkdir -p /app/logs

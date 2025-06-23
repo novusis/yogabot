@@ -5,8 +5,6 @@ services:
     build: .
     container_name: yoga-telegram-bot
     restart: unless-stopped
-    env_file:
-      - .env
     volumes:
       - ./logs:/app/logs  # Для логов (опционально)
     environment:
@@ -14,12 +12,6 @@ services:
       - PYTHONUNBUFFERED=1
     networks:
       - bot-network
-    healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('https://api.telegram.org/bot${BOT_TOKEN}/getMe', timeout=10)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
 
 networks:
   bot-network:

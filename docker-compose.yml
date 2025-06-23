@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  yoga-bot:
+    build: .
+    container_name: yoga-telegram-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs  # Для логов (опционально)
+    environment:
+      - TZ=Europe/Moscow  # Установите свой часовой пояс
+      - PYTHONUNBUFFERED=1
+    networks:
+      - bot-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('https://api.telegram.org/bot${BOT_TOKEN}/getMe', timeout=10)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  bot-network:
+    driver: bridge

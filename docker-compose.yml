@@ -8,8 +8,8 @@ services:
     env_file:
       - .env
     volumes:
-      - ./logs:/app/logs  # Для логов (опционально)
-      - ./app/db:/app/db      # Для базы данных
+      - ./logs:/app/logs      # Для логов (опционально)
+      - app/db:/app/db      # Для базы данных
     environment:
       - TZ=Asia/Ho_Chi_Minh  # Установите свой часовой пояс
       - PYTHONUNBUFFERED=1

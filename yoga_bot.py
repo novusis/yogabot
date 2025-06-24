@@ -25,7 +25,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID")) if os.getenv("ADMIN_ID") else None
 ADMIN_NAMES = os.getenv("ADMIN_USERNAMES", "").split(",") if os.getenv("ADMIN_USERNAMES") else []
 
 # База данных
-DB_PATH = "app/db/yoga_bot.db"
+DB_PATH = "db/yoga_bot.db"
 
 
 class DatabaseManager:

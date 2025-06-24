@@ -10,6 +10,7 @@ __pycache__/
 venv/
 .env/
 .venv/
+.db/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
@@ -55,3 +56,4 @@ bandit.json
 # Windows
 Thumbs.db
 ehthumbs.db
+/app/db/yoga_bot.db

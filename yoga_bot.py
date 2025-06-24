@@ -1,8 +1,8 @@
 import asyncio
 import logging
 import os
+import sqlite3
 from typing import Dict, List, Optional
-from dataclasses import dataclass, field
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command, StateFilter
@@ -13,44 +13,283 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # Токен бота (замените на свой)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+print(f". BOT_TOKEN <{BOT_TOKEN}>")
 
-# ID и username администратороы
-ADMIN_ID = os.getenv("ADMIN_ID")
-ADMIN_NAMES = os.getenv("ADMIN_USERNAMES", "")
+# ID и username администраторов
+ADMIN_ID = int(os.getenv("ADMIN_ID")) if os.getenv("ADMIN_ID") else None
+ADMIN_NAMES = os.getenv("ADMIN_USERNAMES", "").split(",") if os.getenv("ADMIN_USERNAMES") else []
 
-@dataclass
-class YogaClass:
-    name: str
-    max_participants: int
-    registrations: Dict[int, int] = field(default_factory=dict)  # user_id: количество участников
+# База данных
+DB_PATH = "app/db/yoga_bot.db"
 
-@dataclass
-class BotData:
-    schedule: List[YogaClass] = field(default_factory=list)
 
-# Глобальные данные бота
-bot_data = BotData()
+class DatabaseManager:
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
+        print(f"DatabaseManager.__init__ db_path <{db_path}>")
+        # Создаем директорию для БД если её нет
+        # os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.init_database()
+
+    def init_database(self):
+        """Инициализация базы данных"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            # Таблица занятий
+            cursor.execute('''
+                           CREATE TABLE IF NOT EXISTS yoga_classes
+                           (
+                               id
+                               INTEGER
+                               PRIMARY
+                               KEY
+                               AUTOINCREMENT,
+                               name
+                               TEXT
+                               NOT
+                               NULL,
+                               max_participants
+                               INTEGER
+                               NOT
+                               NULL,
+                               created_at
+                               TIMESTAMP
+                               DEFAULT
+                               CURRENT_TIMESTAMP
+                           )
+                           ''')
+
+            # Таблица регистраций
+            cursor.execute('''
+                           CREATE TABLE IF NOT EXISTS registrations
+                           (
+                               id
+                               INTEGER
+                               PRIMARY
+                               KEY
+                               AUTOINCREMENT,
+                               user_id
+                               INTEGER
+                               NOT
+                               NULL,
+                               class_id
+                               INTEGER
+                               NOT
+                               NULL,
+                               participant_count
+                               INTEGER
+                               DEFAULT
+                               1,
+                               created_at
+                               TIMESTAMP
+                               DEFAULT
+                               CURRENT_TIMESTAMP,
+                               FOREIGN
+                               KEY
+                           (
+                               class_id
+                           ) REFERENCES yoga_classes
+                           (
+                               id
+                           ) ON DELETE CASCADE
+                               )
+                           ''')
+
+            conn.commit()
+
+    def add_yoga_class(self, name: str, max_participants: int) -> int:
+        """Добавить занятие"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO yoga_classes (name, max_participants) VALUES (?, ?)",
+                (name, max_participants)
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_yoga_classes(self) -> List[Dict]:
+        """Получить все занятия"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, name, max_participants FROM yoga_classes ORDER BY id")
+            columns = [description[0] for description in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def delete_yoga_class(self, class_id: int):
+        """Удалить занятие"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM yoga_classes WHERE id = ?", (class_id,))
+            conn.commit()
+
+    def clear_all_classes(self):
+        """Удалить все занятия"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM yoga_classes")
+            cursor.execute("DELETE FROM registrations")
+            conn.commit()
+
+    def register_user(self, user_id: int, class_id: int, participant_count: int = 1):
+        """Записать пользователя на занятие"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            # Проверяем, есть ли уже запись
+            cursor.execute(
+                "SELECT participant_count FROM registrations WHERE user_id = ? AND class_id = ?",
+                (user_id, class_id)
+            )
+            existing = cursor.fetchone()
+
+            if existing:
+                # Обновляем количество участников
+                new_count = existing[0] + participant_count
+                cursor.execute(
+                    "UPDATE registrations SET participant_count = ? WHERE user_id = ? AND class_id = ?",
+                    (new_count, user_id, class_id)
+                )
+            else:
+                # Создаем новую запись
+                cursor.execute(
+                    "INSERT INTO registrations (user_id, class_id, participant_count) VALUES (?, ?, ?)",
+                    (user_id, class_id, participant_count)
+                )
+            conn.commit()
+
+    def get_user_registrations(self, user_id: int) -> List[Dict]:
+        """Получить записи пользователя"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                           SELECT r.class_id, yc.name, r.participant_count
+                           FROM registrations r
+                                    JOIN yoga_classes yc ON r.class_id = yc.id
+                           WHERE r.user_id = ?
+                           ORDER BY yc.id
+                           """, (user_id,))
+            columns = ['class_id', 'name', 'participant_count']
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def get_class_registrations(self, class_id: int) -> List[Dict]:
+        """Получить записи на конкретное занятие"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT user_id, participant_count FROM registrations WHERE class_id = ?",
+                (class_id,)
+            )
+            columns = ['user_id', 'participant_count']
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def get_all_registrations(self) -> List[Dict]:
+        """Получить все записи"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                           SELECT yc.name, r.user_id, r.participant_count
+                           FROM registrations r
+                                    JOIN yoga_classes yc ON r.class_id = yc.id
+                           ORDER BY yc.id, r.user_id
+                           """)
+            columns = ['class_name', 'user_id', 'participant_count']
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def delete_user_registration(self, user_id: int, class_id: int, all_participants: bool = False):
+        """Удалить запись пользователя"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            if all_participants:
+                # Удаляем всю запись
+                cursor.execute(
+                    "DELETE FROM registrations WHERE user_id = ? AND class_id = ?",
+                    (user_id, class_id)
+                )
+            else:
+                # Уменьшаем количество участников на 1
+                cursor.execute(
+                    "SELECT participant_count FROM registrations WHERE user_id = ? AND class_id = ?",
+                    (user_id, class_id)
+                )
+                current_count = cursor.fetchone()
+
+                if current_count and current_count[0] > 1:
+                    cursor.execute(
+                        "UPDATE registrations SET participant_count = participant_count - 1 WHERE user_id = ? AND class_id = ?",
+                        (user_id, class_id)
+                    )
+                else:
+                    cursor.execute(
+                        "DELETE FROM registrations WHERE user_id = ? AND class_id = ?",
+                        (user_id, class_id)
+                    )
+            conn.commit()
+
+    def get_registered_users_for_class(self, class_id: int) -> List[int]:
+        """Получить список пользователей, записанных на занятие"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT user_id FROM registrations WHERE class_id = ?", (class_id,))
+            return [row[0] for row in cursor.fetchall()]
+
+    def get_all_registered_users(self) -> List[int]:
+        """Получить всех пользователей, у которых есть записи"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT user_id FROM registrations")
+            return [row[0] for row in cursor.fetchall()]
+
+    def get_total_participants(self, class_id: int) -> int:
+        """Получить общее количество участников на занятии"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COALESCE(SUM(participant_count), 0) FROM registrations WHERE class_id = ?",
+                (class_id,)
+            )
+            return cursor.fetchone()[0]
+
+
+# Инициализация базы данных
+db = DatabaseManager()
+
 
 # Состояния FSM
 class AdminStates(StatesGroup):
     waiting_class_name = State()
     waiting_class_capacity = State()
     waiting_broadcast_message = State()
-    waiting_reorder_index = State()
+
 
 class BotStates(StatesGroup):
     main_menu = State()
+
 
 # Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+
+def check_admin(from_user):
+    """Проверка прав администратора"""
+    if ADMIN_ID and from_user.id == ADMIN_ID:
+        return True
+    if ADMIN_NAMES and from_user.username in ADMIN_NAMES:
+        return True
+    return False
+
+
 def get_main_keyboard(admin) -> InlineKeyboardMarkup:
     """Получить основную клавиатуру в зависимости от роли пользователя"""
     buttons = [
-        [InlineKeyboardButton(text="📅 Расписание", callback_data="schedule")],
+        [InlineKeyboardButton(text="🗓 Расписание", callback_data="schedule")],
         [InlineKeyboardButton(text="📝 Моя запись", callback_data="my_registration")]
     ]
 
@@ -62,42 +301,50 @@ def get_main_keyboard(admin) -> InlineKeyboardMarkup:
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+
 def get_schedule_keyboard() -> InlineKeyboardMarkup:
     """Получить клавиатуру с доступными занятиями"""
-    if not bot_data.schedule:
+    classes = db.get_yoga_classes()
+
+    if not classes:
         return None
 
     buttons = []
-    for i, yoga_class in enumerate(bot_data.schedule):
-        total_registered = sum(yoga_class.registrations.values())
-        available = yoga_class.max_participants - total_registered
+    for yoga_class in classes:
+        total_registered = db.get_total_participants(yoga_class['id'])
+        available = yoga_class['max_participants'] - total_registered
         if available > 0:
-            text = f"{yoga_class.name} (свободно: {available})"
-            buttons.append([InlineKeyboardButton(text=text, callback_data=f"register_{i}")])
+            text = f"{yoga_class['name']} (свободно: {available})"
+            buttons.append([InlineKeyboardButton(text=text, callback_data=f"register_{yoga_class['id']}")])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+
 
 def get_my_registrations_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Получить клавиатуру с занятиями пользователя"""
-    buttons = []
-    for i, yoga_class in enumerate(bot_data.schedule):
-        if user_id in yoga_class.registrations and yoga_class.registrations[user_id] > 0:
-            count = yoga_class.registrations[user_id]
-            text = f"{yoga_class.name} ({count} чел.)"
-            buttons.append([InlineKeyboardButton(text=text, callback_data=f"my_class_{i}")])
+    registrations = db.get_user_registrations(user_id)
 
-    return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+    if not registrations:
+        return None
+
+    buttons = []
+    for reg in registrations:
+        text = f"{reg['name']} ({reg['participant_count']} чел.)"
+        buttons.append([InlineKeyboardButton(text=text, callback_data=f"my_class_{reg['class_id']}")])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 
 def get_admin_schedule_keyboard() -> InlineKeyboardMarkup:
     """Получить клавиатуру управления расписанием для админа"""
     buttons = [
         [InlineKeyboardButton(text="➕ Добавить занятие", callback_data="admin_add_class")],
         [InlineKeyboardButton(text="❌ Удалить занятие", callback_data="admin_delete_class")],
-        [InlineKeyboardButton(text="🔄 Изменить порядок занятий", callback_data="admin_reorder")],
         [InlineKeyboardButton(text="🗑 Удалить расписание", callback_data="admin_delete_schedule")],
         [InlineKeyboardButton(text="📢 Оповестить!", callback_data="admin_broadcast")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 
 @dp.message(Command("start"))
 async def start_handler(message: Message, state: FSMContext):
@@ -105,6 +352,7 @@ async def start_handler(message: Message, state: FSMContext):
     await state.set_state(BotStates.main_menu)
     keyboard = get_main_keyboard(check_admin(message.from_user))
     await message.answer("Добро пожаловать в бот для записи на йогу! 🧘‍♀️", reply_markup=keyboard)
+
 
 @dp.callback_query(F.data == "schedule")
 async def schedule_handler(callback: CallbackQuery):
@@ -118,60 +366,84 @@ async def schedule_handler(callback: CallbackQuery):
         main_keyboard = get_main_keyboard(check_admin(callback.from_user))
         await callback.message.edit_text(text, reply_markup=main_keyboard)
 
+
 @dp.callback_query(F.data.startswith("register_"))
 async def register_handler(callback: CallbackQuery):
     """Записаться на занятие"""
-    class_index = int(callback.data.split("_")[1])
+    class_id = int(callback.data.split("_")[1])
     user_id = callback.from_user.id
-    yoga_class = bot_data.schedule[class_index]
+
+    # Получаем информацию о занятии
+    classes = db.get_yoga_classes()
+    yoga_class = next((c for c in classes if c['id'] == class_id), None)
+
+    if not yoga_class:
+        await callback.answer("Занятие не найдено!", show_alert=True)
+        return
 
     # Проверяем доступность мест
-    total_registered = sum(yoga_class.registrations.values())
-    if total_registered >= yoga_class.max_participants:
+    total_registered = db.get_total_participants(class_id)
+    if total_registered >= yoga_class['max_participants']:
         await callback.answer("К сожалению, все места заняты!", show_alert=True)
         return
 
     # Записываем пользователя
-    if user_id not in yoga_class.registrations:
-        yoga_class.registrations[user_id] = 0
-    yoga_class.registrations[user_id] += 1
+    db.register_user(user_id, class_id, 1)
 
-    count = yoga_class.registrations[user_id]
-    text = f"Вы записаны на {yoga_class.name}!\nВсего участников: {count}"
+    # Получаем количество участников пользователя
+    registrations = db.get_user_registrations(user_id)
+    user_reg = next((r for r in registrations if r['class_id'] == class_id), None)
+    count = user_reg['participant_count'] if user_reg else 1
+
+    text = f"Вы записаны на {yoga_class['name']}!\nВсего участников: {count}"
 
     buttons = [
-        [InlineKeyboardButton(text="➕ Добавить еще участника", callback_data=f"add_participant_{class_index}")],
-        [InlineKeyboardButton(text="📅 Записаться еще", callback_data="schedule")]
+        [InlineKeyboardButton(text="➕ Добавить еще участника", callback_data=f"add_participant_{class_id}")],
+        [InlineKeyboardButton(text="🗓 Записаться еще", callback_data="schedule")]
     ]
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     await callback.message.edit_text(text, reply_markup=keyboard)
+
 
 @dp.callback_query(F.data.startswith("add_participant_"))
 async def add_participant_handler(callback: CallbackQuery):
     """Добавить еще участника"""
-    class_index = int(callback.data.split("_")[2])
+    class_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
-    yoga_class = bot_data.schedule[class_index]
+
+    # Получаем информацию о занятии
+    classes = db.get_yoga_classes()
+    yoga_class = next((c for c in classes if c['id'] == class_id), None)
+
+    if not yoga_class:
+        await callback.answer("Занятие не найдено!", show_alert=True)
+        return
 
     # Проверяем доступность мест
-    total_registered = sum(yoga_class.registrations.values())
-    if total_registered >= yoga_class.max_participants:
+    total_registered = db.get_total_participants(class_id)
+    if total_registered >= yoga_class['max_participants']:
         await callback.answer("К сожалению, все места заняты!", show_alert=True)
         return
 
-    yoga_class.registrations[user_id] += 1
-    count = yoga_class.registrations[user_id]
+    # Добавляем участника
+    db.register_user(user_id, class_id, 1)
 
-    text = f"Вы записали {count} человека на {yoga_class.name}"
+    # Получаем обновленное количество
+    registrations = db.get_user_registrations(user_id)
+    user_reg = next((r for r in registrations if r['class_id'] == class_id), None)
+    count = user_reg['participant_count'] if user_reg else 1
+
+    text = f"Вы записали {count} человека на {yoga_class['name']}"
 
     buttons = [
-        [InlineKeyboardButton(text="➕ Добавить еще участника", callback_data=f"add_participant_{class_index}")],
-        [InlineKeyboardButton(text="📅 Записаться еще", callback_data="schedule")]
+        [InlineKeyboardButton(text="➕ Добавить еще участника", callback_data=f"add_participant_{class_id}")],
+        [InlineKeyboardButton(text="🗓 Записаться еще", callback_data="schedule")]
     ]
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     await callback.message.edit_text(text, reply_markup=keyboard)
+
 
 @dp.callback_query(F.data == "my_registration")
 async def my_registration_handler(callback: CallbackQuery):
@@ -185,82 +457,107 @@ async def my_registration_handler(callback: CallbackQuery):
         main_keyboard = get_main_keyboard(check_admin(callback.from_user))
         await callback.message.edit_text(text, reply_markup=main_keyboard)
 
+
 @dp.callback_query(F.data.startswith("my_class_"))
 async def my_class_handler(callback: CallbackQuery):
     """Управление конкретной записью"""
-    class_index = int(callback.data.split("_")[2])
-    yoga_class = bot_data.schedule[class_index]
+    class_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
 
-    count = yoga_class.registrations.get(user_id, 0)
-    text = f"{yoga_class.name}\nВаших участников: {count}"
+    # Получаем информацию о занятии и записи
+    classes = db.get_yoga_classes()
+    yoga_class = next((c for c in classes if c['id'] == class_id), None)
+
+    if not yoga_class:
+        await callback.answer("Занятие не найдено!", show_alert=True)
+        return
+
+    registrations = db.get_user_registrations(user_id)
+    user_reg = next((r for r in registrations if r['class_id'] == class_id), None)
+
+    if not user_reg:
+        await callback.answer("Запись не найдена!", show_alert=True)
+        return
+
+    count = user_reg['participant_count']
+    text = f"{yoga_class['name']}\nВаших участников: {count}"
 
     buttons = [
-        [InlineKeyboardButton(text="➕ Добавить еще участника", callback_data=f"add_participant_{class_index}")],
-        [InlineKeyboardButton(text="❌ Удалить запись", callback_data=f"delete_registration_{class_index}")]
+        [InlineKeyboardButton(text="➕ Добавить еще участника", callback_data=f"add_participant_{class_id}")],
+        [InlineKeyboardButton(text="❌ Удалить запись", callback_data=f"delete_registration_{class_id}")]
     ]
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     await callback.message.edit_text(text, reply_markup=keyboard)
 
+
 @dp.callback_query(F.data.startswith("delete_registration_"))
 async def delete_registration_handler(callback: CallbackQuery):
     """Удалить запись"""
-    class_index = int(callback.data.split("_")[2])
+    class_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
-    yoga_class = bot_data.schedule[class_index]
 
-    count = yoga_class.registrations.get(user_id, 0)
+    # Получаем информацию о записи
+    registrations = db.get_user_registrations(user_id)
+    user_reg = next((r for r in registrations if r['class_id'] == class_id), None)
+
+    if not user_reg:
+        await callback.answer("Запись не найдена!", show_alert=True)
+        return
+
+    count = user_reg['participant_count']
+    classes = db.get_yoga_classes()
+    yoga_class = next((c for c in classes if c['id'] == class_id), None)
 
     if count == 1:
         # Удаляем сразу если только один участник
-        del yoga_class.registrations[user_id]
-        text = f"Ваша запись на {yoga_class.name} удалена."
+        db.delete_user_registration(user_id, class_id, all_participants=True)
+        text = f"Ваша запись на {yoga_class['name']} удалена."
         main_keyboard = get_main_keyboard(check_admin(callback.from_user))
         await callback.message.edit_text(text, reply_markup=main_keyboard)
     elif count > 1:
         # Если несколько участников, предлагаем варианты
-        text = f"На {yoga_class.name} записано несколько участников, какую запись вы хотите удалить?"
+        text = f"На {yoga_class['name']} записано несколько участников, какую запись вы хотите удалить?"
         buttons = [
-            [InlineKeyboardButton(text="❌ Удалить всех", callback_data=f"delete_all_{class_index}")],
-            [InlineKeyboardButton(text="➖ Удалить одного участника", callback_data=f"delete_one_{class_index}")],
+            [InlineKeyboardButton(text="❌ Удалить всех", callback_data=f"delete_all_{class_id}")],
+            [InlineKeyboardButton(text="➖ Удалить одного участника", callback_data=f"delete_one_{class_id}")],
             [InlineKeyboardButton(text="↩️ Оставить запись", callback_data="my_registration")]
         ]
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
         await callback.message.edit_text(text, reply_markup=keyboard)
 
+
 @dp.callback_query(F.data.startswith("delete_all_"))
 async def delete_all_handler(callback: CallbackQuery):
     """Удалить всех участников"""
-    class_index = int(callback.data.split("_")[2])
+    class_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
-    yoga_class = bot_data.schedule[class_index]
 
-    del yoga_class.registrations[user_id]
-    text = f"Все ваши записи на {yoga_class.name} удалены."
+    classes = db.get_yoga_classes()
+    yoga_class = next((c for c in classes if c['id'] == class_id), None)
+
+    db.delete_user_registration(user_id, class_id, all_participants=True)
+    text = f"Все ваши записи на {yoga_class['name']} удалены."
     main_keyboard = get_main_keyboard(check_admin(callback.from_user))
     await callback.message.edit_text(text, reply_markup=main_keyboard)
+
 
 @dp.callback_query(F.data.startswith("delete_one_"))
 async def delete_one_handler(callback: CallbackQuery):
     """Удалить одного участника"""
-    class_index = int(callback.data.split("_")[2])
+    class_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
-    yoga_class = bot_data.schedule[class_index]
 
-    yoga_class.registrations[user_id] -= 1
-    if yoga_class.registrations[user_id] <= 0:
-        del yoga_class.registrations[user_id]
+    classes = db.get_yoga_classes()
+    yoga_class = next((c for c in classes if c['id'] == class_id), None)
 
-    text = f"Один участник удален из записи на {yoga_class.name}."
+    db.delete_user_registration(user_id, class_id, all_participants=False)
+    text = f"Один участник удален из записи на {yoga_class['name']}."
     main_keyboard = get_main_keyboard(check_admin(callback.from_user))
     await callback.message.edit_text(text, reply_markup=main_keyboard)
 
+
 # АДМИНСКИЕ ФУНКЦИИ
-
-def check_admin(from_user):
-    return from_user.id == ADMIN_ID or from_user.username in ADMIN_NAMES
-
 
 @dp.callback_query(F.data == "admin_view_registrations")
 async def admin_view_registrations(callback: CallbackQuery):
@@ -269,26 +566,34 @@ async def admin_view_registrations(callback: CallbackQuery):
         await callback.answer("У вас нет прав доступа!")
         return
 
-    if not bot_data.schedule:
-        text = "Расписание пустое."
+    registrations = db.get_all_registrations()
+
+    if not registrations:
+        text = "Записей нет."
     else:
         text = "Текущие записи:\n\n"
-        for yoga_class in bot_data.schedule:
-            if yoga_class.registrations:
-                text += f"📅 {yoga_class.name}:\n"
-                for user_id, count in yoga_class.registrations.items():
-                    try:
-                        user = await bot.get_chat(user_id)
-                        name = user.first_name or f"ID{user_id}"
-                        if count > 1:
-                            name += f" +{count-1}"
-                        text += f"  • {name}\n"
-                    except:
-                        text += f"  • ID{user_id} ({count} чел.)\n"
-                text += "\n"
+        current_class = None
+
+        for reg in registrations:
+            if current_class != reg['class_name']:
+                current_class = reg['class_name']
+                text += f"🗓 {current_class}:\n"
+
+            try:
+                user = await bot.get_chat(reg['user_id'])
+                name = user.first_name or f"ID{reg['user_id']}"
+                if(user.username != None):
+                    name += f" @{user.username}"
+                if reg['participant_count'] > 1:
+                    name += f" +{reg['participant_count'] - 1}"
+                text += f"  • {name}\n"
+            except:
+                text += f"  • ID{reg['user_id']} ({reg['participant_count']} чел.)\n"
+        text += "\n"
 
     main_keyboard = get_main_keyboard(check_admin(callback.from_user))
     await callback.message.edit_text(text, reply_markup=main_keyboard)
+
 
 @dp.callback_query(F.data == "admin_manage_schedule")
 async def admin_manage_schedule(callback: CallbackQuery):
@@ -300,6 +605,7 @@ async def admin_manage_schedule(callback: CallbackQuery):
     text = "Какие изменения в расписании вы хотите сделать?"
     keyboard = get_admin_schedule_keyboard()
     await callback.message.edit_text(text, reply_markup=keyboard)
+
 
 @dp.callback_query(F.data == "admin_add_class")
 async def admin_add_class(callback: CallbackQuery, state: FSMContext):
@@ -313,6 +619,7 @@ async def admin_add_class(callback: CallbackQuery, state: FSMContext):
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await callback.message.edit_text(text, reply_markup=keyboard)
 
+
 @dp.callback_query(F.data == "cancel_creation")
 async def cancel_creation(callback: CallbackQuery, state: FSMContext):
     """Отменить создание занятия"""
@@ -320,6 +627,7 @@ async def cancel_creation(callback: CallbackQuery, state: FSMContext):
     keyboard = get_admin_schedule_keyboard()
     text = "Какие изменения в расписании вы хотите сделать?"
     await callback.message.edit_text(text, reply_markup=keyboard)
+
 
 @dp.message(StateFilter(AdminStates.waiting_class_name))
 async def process_class_name(message: Message, state: FSMContext):
@@ -339,6 +647,7 @@ async def process_class_name(message: Message, state: FSMContext):
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await message.answer(text, reply_markup=keyboard)
 
+
 @dp.message(StateFilter(AdminStates.waiting_class_capacity))
 async def process_class_capacity(message: Message, state: FSMContext):
     """Обработка количества мест"""
@@ -347,7 +656,7 @@ async def process_class_capacity(message: Message, state: FSMContext):
         if capacity <= 0:
             raise ValueError()
     except (ValueError, TypeError):
-        text = "Ошибка, укажите количество число мест доступных для занятия?"
+        text = "Ошибка, укажите корректное число мест доступных для занятия"
         buttons = [[InlineKeyboardButton(text="❌ Отменить создание", callback_data="cancel_creation")]]
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
         await message.answer(text, reply_markup=keyboard)
@@ -357,18 +666,18 @@ async def process_class_capacity(message: Message, state: FSMContext):
     class_name = data['class_name']
 
     # Создаем новое занятие
-    new_class = YogaClass(name=class_name, max_participants=capacity)
-    bot_data.schedule.append(new_class)
+    class_id = db.add_yoga_class(class_name, capacity)
 
     await state.clear()
 
     text = f"Вы создали занятие {class_name} с количеством мест {capacity}."
     buttons = [
         [InlineKeyboardButton(text="➕ Добавить еще одно занятие", callback_data="admin_add_class")],
-        [InlineKeyboardButton(text="📅 Расписание", callback_data="admin_manage_schedule")]
+        [InlineKeyboardButton(text="🗓 Расписание", callback_data="admin_manage_schedule")]
     ]
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await message.answer(text, reply_markup=keyboard)
+
 
 @dp.callback_query(F.data == "admin_delete_class")
 async def admin_delete_class(callback: CallbackQuery):
@@ -376,7 +685,9 @@ async def admin_delete_class(callback: CallbackQuery):
     if not check_admin(callback.from_user):
         return
 
-    if not bot_data.schedule:
+    classes = db.get_yoga_classes()
+
+    if not classes:
         text = "Нет занятий для удаления."
         keyboard = get_admin_schedule_keyboard()
         await callback.message.edit_text(text, reply_markup=keyboard)
@@ -384,34 +695,69 @@ async def admin_delete_class(callback: CallbackQuery):
 
     text = "Какое занятие вы хотите удалить?"
     buttons = []
-    for i, yoga_class in enumerate(bot_data.schedule):
-        buttons.append([InlineKeyboardButton(text=yoga_class.name, callback_data=f"confirm_delete_{i}")])
+    for yoga_class in classes:
+        buttons.append([InlineKeyboardButton(text=yoga_class['name'], callback_data=f"confirm_delete_{yoga_class['id']}")])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await callback.message.edit_text(text, reply_markup=keyboard)
 
+
+@dp.callback_query(F.data == "admin_delete_class")
+async def admin_delete_class(callback: CallbackQuery):
+    """Удалить занятие"""
+    if not check_admin(callback.from_user):
+        return
+
+    classes = db.get_yoga_classes()
+
+    if not classes:
+        text = "Нет занятий для удаления."
+        keyboard = get_admin_schedule_keyboard()
+        await callback.message.edit_text(text, reply_markup=keyboard)
+        return
+
+    text = "Какое занятие вы хотите удалить?"
+    buttons = []
+    for yoga_class in classes:
+        buttons.append([InlineKeyboardButton(text=yoga_class['name'], callback_data=f"confirm_delete_{yoga_class['id']}")])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+
+
 @dp.callback_query(F.data.startswith("confirm_delete_"))
 async def confirm_delete_class(callback: CallbackQuery):
     """Подтвердить удаление занятия"""
-    class_index = int(callback.data.split("_")[2])
-    yoga_class = bot_data.schedule[class_index]
+    class_id = int(callback.data.split("_")[2])
+
+    # Получаем информацию о занятии
+    classes = db.get_yoga_classes()
+    yoga_class = next((c for c in classes if c['id'] == class_id), None)
+
+    if not yoga_class:
+        await callback.answer("Занятие не найдено!", show_alert=True)
+        return
+
+    # Получаем список пользователей, записанных на это занятие
+    registered_users = db.get_registered_users_for_class(class_id)
 
     # Уведомляем участников об отмене
-    for user_id in yoga_class.registrations.keys():
+    for user_id in registered_users:
         try:
-            text = f"К сожалению занятие {yoga_class.name} не состоится, приносим извинения..."
-            buttons = [[InlineKeyboardButton(text="📅 Расписание", callback_data="schedule")]]
+            text = f"К сожалению занятие {yoga_class['name']} не состоится, приносим извинения..."
+            buttons = [[InlineKeyboardButton(text="🗓 Расписание", callback_data="schedule")]]
             keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
             await bot.send_message(user_id, text, reply_markup=keyboard)
         except:
             pass  # Игнорируем ошибки отправки
 
-    # Удаляем занятие
-    bot_data.schedule.pop(class_index)
+    # Удаляем занятие из базы данных
+    db.delete_yoga_class(class_id)
 
-    text = f"Занятие {yoga_class.name} удалено. Участники уведомлены."
+    text = f"Занятие {yoga_class['name']} удалено. Участники уведомлены."
     keyboard = get_admin_schedule_keyboard()
     await callback.message.edit_text(text, reply_markup=keyboard)
+
 
 @dp.callback_query(F.data == "admin_delete_schedule")
 async def admin_delete_schedule(callback: CallbackQuery):
@@ -427,13 +773,30 @@ async def admin_delete_schedule(callback: CallbackQuery):
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await callback.message.edit_text(text, reply_markup=keyboard)
 
+
 @dp.callback_query(F.data == "confirm_delete_all")
 async def confirm_delete_all_schedule(callback: CallbackQuery):
     """Подтвердить удаление всего расписания"""
-    bot_data.schedule.clear()
-    text = "Все расписание удалено."
+    # Получаем всех пользователей с записями для уведомления
+    all_users = db.get_all_registered_users()
+
+    # Уведомляем всех пользователей
+    for user_id in all_users:
+        try:
+            text = "К сожалению все занятия отменены, приносим извинения..."
+            buttons = [[InlineKeyboardButton(text="🗓 Расписание", callback_data="schedule")]]
+            keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+            await bot.send_message(user_id, text, reply_markup=keyboard)
+        except:
+            pass  # Игнорируем ошибки отправки
+
+    # Удаляем все занятия и записи
+    db.clear_all_classes()
+
+    text = "Все расписание удалено. Участники уведомлены."
     keyboard = get_admin_schedule_keyboard()
     await callback.message.edit_text(text, reply_markup=keyboard)
+
 
 @dp.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast(callback: CallbackQuery, state: FSMContext):
@@ -447,6 +810,7 @@ async def admin_broadcast(callback: CallbackQuery, state: FSMContext):
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await callback.message.edit_text(text, reply_markup=keyboard)
 
+
 @dp.callback_query(F.data == "cancel_broadcast")
 async def cancel_broadcast(callback: CallbackQuery, state: FSMContext):
     """Отменить рассылку"""
@@ -455,15 +819,14 @@ async def cancel_broadcast(callback: CallbackQuery, state: FSMContext):
     text = "Какие изменения в расписании вы хотите сделать?"
     await callback.message.edit_text(text, reply_markup=keyboard)
 
+
 @dp.message(StateFilter(AdminStates.waiting_broadcast_message))
 async def process_broadcast(message: Message, state: FSMContext):
     """Обработка рассылки"""
     broadcast_text = message.text
 
-    # Собираем всех пользователей
-    all_users = set()
-    for yoga_class in bot_data.schedule:
-        all_users.update(yoga_class.registrations.keys())
+    # Получаем всех пользователей с записями
+    all_users = db.get_all_registered_users()
 
     # Отправляем сообщение всем
     sent_count = 0
@@ -480,10 +843,12 @@ async def process_broadcast(message: Message, state: FSMContext):
     keyboard = get_admin_schedule_keyboard()
     await message.answer(text, reply_markup=keyboard)
 
+
 async def main():
     """Запуск бота"""
     print("Бот запущен!")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

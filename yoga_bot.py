@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from aiogram import Bot, Dispatcher, F
@@ -13,11 +14,11 @@ from aiogram.fsm.storage.memory import MemoryStorage
 logging.basicConfig(level=logging.INFO)
 
 # Токен бота (замените на свой)
-BOT_TOKEN = "7530833645:AAERRJBRD-VgE5SfRazY0FkUHHAjXT1MieQ"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# ID администратора (замените на свой)
-ADMIN_ID = 123456789  # Замените на ваш Telegram ID
-ADMIN_NAMES = ["novusis", "Eli_Hell"]  # Замените на ваш Telegram ID
+# ID и username администратороы
+ADMIN_ID = os.getenv("ADMIN_ID")
+ADMIN_NAMES = os.getenv("ADMIN_USERNAMES", "")
 
 @dataclass
 class YogaClass:

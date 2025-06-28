@@ -3,8 +3,8 @@ import logging
 import os
 import sqlite3
 from typing import Dict, List, Optional
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -14,9 +14,11 @@ from aiogram.fsm.storage.memory import MemoryStorage
 logging.basicConfig(level=logging.INFO)
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
-# Токен бота (замените на свой)
+# Токен бота
+VERSION = "v0.2"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 print(f". BOT_TOKEN <{BOT_TOKEN}>")
 
@@ -101,6 +103,45 @@ class DatabaseManager:
                                )
                            ''')
 
+            # Таблица настроек
+            cursor.execute('''
+                           CREATE TABLE IF NOT EXISTS settings
+                           (
+                               key
+                               TEXT
+                               PRIMARY
+                               KEY,
+                               value
+                               TEXT
+                               NOT
+                               NULL
+                           )
+                           ''')
+
+            conn.commit()
+
+    def get_start_description(self) -> str:
+        """Получить стартовое описание"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM settings WHERE key = 'start_description'")
+            result = cursor.fetchone()
+
+            if result:
+                return result[0]
+            else:
+                # Возвращаем описание по умолчанию
+                return ("🌿 Здравствуйте! Меня зовут Елена Лазарева — я преподаватель Йоги Айенгара 🧘‍♀️\n"
+                        "Буду рада видеть вас на моих занятиях 🙏✨")
+
+    def set_start_description(self, description: str):
+        """Установить стартовое описание"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('start_description', ?)",
+                (description,)
+            )
             conn.commit()
 
     def add_yoga_class(self, name: str, max_participants: int) -> int:
@@ -266,6 +307,7 @@ class AdminStates(StatesGroup):
     waiting_class_name = State()
     waiting_class_capacity = State()
     waiting_broadcast_message = State()
+    waiting_start_description = State()
 
 
 class BotStates(StatesGroup):
@@ -290,7 +332,7 @@ def get_main_keyboard(admin) -> InlineKeyboardMarkup:
     """Получить основную клавиатуру в зависимости от роли пользователя"""
     buttons = [
         [InlineKeyboardButton(text="🗓 Расписание", callback_data="schedule")],
-        [InlineKeyboardButton(text="📝 Моя запись", callback_data="my_registration")]
+        [InlineKeyboardButton(text="🕰 Моя запись", callback_data="my_registration")]
     ]
 
     if admin:
@@ -341,17 +383,40 @@ def get_admin_schedule_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="➕ Добавить занятие", callback_data="admin_add_class")],
         [InlineKeyboardButton(text="❌ Удалить занятие", callback_data="admin_delete_class")],
         [InlineKeyboardButton(text="🗑 Удалить расписание", callback_data="admin_delete_schedule")],
+        [InlineKeyboardButton(text="📝 Изменить стартовое описание", callback_data="admin_edit_description")],  # Добавить эту строку
         [InlineKeyboardButton(text="📢 Оповестить!", callback_data="admin_broadcast")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_system_keyboard() -> ReplyKeyboardMarkup:
+    """Получить системную клавиатуру"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🗓 Расписание"), KeyboardButton(text="🕰 Моя запись")],
+            [KeyboardButton(text="🌐 О учителе")]
+        ],
+        resize_keyboard=True  # Кнопки будут подстраиваться по размеру
+    )
 
 
 @dp.message(Command("start"))
 async def start_handler(message: Message, state: FSMContext):
     """Обработчик команды /start"""
     await state.set_state(BotStates.main_menu)
-    keyboard = get_main_keyboard(check_admin(message.from_user))
-    await message.answer("Добро пожаловать в бот для записи на йогу! 🧘‍♀️", reply_markup=keyboard)
+    admin = check_admin(message.from_user)
+    keyboard = get_main_keyboard(admin)
+    start_answer1 = "Добро пожаловать в бот для записи на йогу! 🧘‍♀️"
+    if admin:
+        start_answer1 = f"<i>{VERSION} - You Admin </i>🙏\n{start_answer1}"
+    await message.answer(start_answer1, reply_markup=get_system_keyboard(), parse_mode="HTML")
+
+    # Получаем стартовое описание из базы данных
+    start_answer2 = db.get_start_description()
+    await message.answer(
+        start_answer2,
+        reply_markup=keyboard
+    )
 
 
 @dp.callback_query(F.data == "schedule")
@@ -359,8 +424,8 @@ async def schedule_handler(callback: CallbackQuery):
     """Показать расписание"""
     keyboard = get_schedule_keyboard()
     if keyboard:
-        text = "Текущее расписание, на какое занятие вы желаете записаться?"
-        await callback.message.edit_text(text, reply_markup=keyboard)
+        text = "На какое занятие вы желаете записаться?\n<b>Текущее расписание:</b>"
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     else:
         text = "К сожалению нет расписания..."
         main_keyboard = get_main_keyboard(check_admin(callback.from_user))
@@ -399,7 +464,8 @@ async def register_handler(callback: CallbackQuery):
 
     buttons = [
         [InlineKeyboardButton(text="➕ Добавить еще участника", callback_data=f"add_participant_{class_id}")],
-        [InlineKeyboardButton(text="🗓 Записаться еще", callback_data="schedule")]
+        [InlineKeyboardButton(text="🗓 Записаться еще", callback_data="schedule")],
+        [InlineKeyboardButton(text="🕰 Моя запись", callback_data="my_registration")]
     ]
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -438,7 +504,8 @@ async def add_participant_handler(callback: CallbackQuery):
 
     buttons = [
         [InlineKeyboardButton(text="➕ Добавить еще участника", callback_data=f"add_participant_{class_id}")],
-        [InlineKeyboardButton(text="🗓 Записаться еще", callback_data="schedule")]
+        [InlineKeyboardButton(text="🗓 Записаться еще", callback_data="schedule")],
+        [InlineKeyboardButton(text="🕰 Моя запись", callback_data="my_registration")]
     ]
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -582,7 +649,7 @@ async def admin_view_registrations(callback: CallbackQuery):
             try:
                 user = await bot.get_chat(reg['user_id'])
                 name = user.first_name or f"ID{reg['user_id']}"
-                if(user.username != None):
+                if (user.username != None):
                     name += f" @{user.username}"
                 if reg['participant_count'] > 1:
                     name += f" +{reg['participant_count'] - 1}"
@@ -820,6 +887,52 @@ async def cancel_broadcast(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(text, reply_markup=keyboard)
 
 
+@dp.callback_query(F.data == "admin_edit_description")
+async def admin_edit_description(callback: CallbackQuery, state: FSMContext):
+    """Изменить стартовое описание"""
+    if not check_admin(callback.from_user):
+        return
+
+    current_description = db.get_start_description()
+
+    await state.set_state(AdminStates.waiting_start_description)
+    text = f"Текущее стартовое описание:\n\n{current_description}\n\nХотите обновить описание? Введите текст снизу."
+    buttons = [[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_description_edit")]]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data == "cancel_description_edit")
+async def cancel_description_edit(callback: CallbackQuery, state: FSMContext):
+    """Отменить редактирование описания"""
+    await state.clear()
+    keyboard = get_admin_schedule_keyboard()
+    text = "Какие изменения в расписании вы хотите сделать?"
+    await callback.message.edit_text(text, reply_markup=keyboard)
+
+
+@dp.message(StateFilter(AdminStates.waiting_start_description))
+async def process_start_description(message: Message, state: FSMContext):
+    """Обработка нового стартового описания"""
+    if not message.text or message.text.strip() == "":
+        text = "Ошибка, укажите описание"
+        buttons = [[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_description_edit")]]
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await message.answer(text, reply_markup=keyboard)
+        return
+
+    new_description = message.text.strip()
+
+    # Сохраняем новое описание в базу данных
+    db.set_start_description(new_description)
+
+    await state.clear()
+
+    text = "Стартовое описание успешно обновлено!"
+    keyboard = get_admin_schedule_keyboard()
+    await message.answer(text, reply_markup=keyboard)
+
+
 @dp.message(StateFilter(AdminStates.waiting_broadcast_message))
 async def process_broadcast(message: Message, state: FSMContext):
     """Обработка рассылки"""
@@ -842,6 +955,37 @@ async def process_broadcast(message: Message, state: FSMContext):
     text = f"Сообщение отправлено {sent_count} пользователям."
     keyboard = get_admin_schedule_keyboard()
     await message.answer(text, reply_markup=keyboard)
+
+
+@dp.message()
+async def handle_message(message: types.Message):
+    if message.text.lower() in ["привет", "hi", "hello", "hey", "meraba", "merhaba", "bonjourno"]:
+        await message.answer("Привет!")
+    else:
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+
+    if message.text == "🗓 Расписание":
+        keyboard = get_schedule_keyboard()
+        if keyboard:
+            text = "На какое занятие вы желаете записаться?\n<b>Текущее расписание:</b>"
+            await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+        else:
+            text = "К сожалению нет расписания..."
+            main_keyboard = get_main_keyboard(check_admin(message.from_user))
+            await message.answer(text, reply_markup=main_keyboard)
+    elif message.text == "🕰 Моя запись":
+        keyboard = get_my_registrations_keyboard(message.from_user.id)
+        if keyboard:
+            text = "Сейчас вы записаны на следующие занятия:"
+            await message.answer(text, reply_markup=keyboard)
+        else:
+            text = "У вас нет активных записей."
+            main_keyboard = get_main_keyboard(check_admin(message.from_user))
+            await message.answer(text, reply_markup=main_keyboard)
+    elif message.text == "🌐 О учителе":
+        await message.answer("https://maps.app.goo.gl/n3HqftvSwE9huSCT9?g_st=it")
+    else:
+        return
 
 
 async def main():

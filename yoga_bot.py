@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import sqlite3
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.filters import Command, StateFilter
@@ -18,9 +18,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Токен бота
-VERSION = "v0.2"
+VERSION = "v0.3"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-print(f". BOT_TOKEN <{BOT_TOKEN}>")
+TEACHER = os.getenv("TEACHER")
 
 # ID и username администраторов
 ADMIN_ID = int(os.getenv("ADMIN_ID")) if os.getenv("ADMIN_ID") else None
@@ -297,6 +297,106 @@ class DatabaseManager:
             )
             return cursor.fetchone()[0]
 
+    def get_all_yoga_classes(self) -> List[Tuple[int, str, int]]:
+        """Получить все занятия с их ID, названием и максимальным количеством участников"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, name, max_participants FROM yoga_classes ORDER BY id"
+            )
+            return cursor.fetchall()
+
+    def get_total_registrations_count(self) -> int:
+        """Получить общее количество регистраций (для проверки целостности данных)"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM registrations")
+            result = cursor.fetchone()
+            return result[0] if result else 0
+
+    def update_class_order(self, class_id: int, new_position: int) -> bool:
+        """Изменить порядок занятия с корректным переносом всех регистраций"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            # Получаем все занятия
+            cursor.execute("SELECT id FROM yoga_classes ORDER BY id")
+            all_classes = cursor.fetchall()
+
+            if not all_classes:
+                return False
+
+            class_ids = [cls[0] for cls in all_classes]
+
+            # Проверяем, существует ли занятие
+            if class_id not in class_ids:
+                return False
+
+            # Удаляем занятие из текущей позиции
+            class_ids.remove(class_id)
+
+            # Вставляем на новую позицию
+            new_position = min(new_position, len(class_ids))  # Ограничиваем максимальной позицией
+            class_ids.insert(new_position, class_id)
+
+            try:
+                # Создаем временные таблицы для сохранения данных
+                cursor.execute("""
+                        CREATE TEMPORARY TABLE temp_classes AS 
+                        SELECT * FROM yoga_classes
+                    """)
+
+                cursor.execute("""
+                        CREATE TEMPORARY TABLE temp_registrations AS 
+                        SELECT * FROM registrations
+                    """)
+
+                # Очищаем основные таблицы
+                cursor.execute("DELETE FROM registrations")
+                cursor.execute("DELETE FROM yoga_classes")
+
+                # Создаем mapping старых ID к новым ID
+                id_mapping = {}
+
+                # Вставляем занятия в новом порядке и создаем маппинг
+                for new_id, old_id in enumerate(class_ids, 1):
+                    cursor.execute("""
+                                   INSERT INTO yoga_classes (id, name, max_participants)
+                                   SELECT ?, name, max_participants
+                                   FROM temp_classes
+                                   WHERE id = ?
+                                   """, (new_id, old_id))
+                    id_mapping[old_id] = new_id
+
+                # Переносим регистрации с новыми ID занятий
+                cursor.execute("SELECT user_id, class_id, participant_count FROM temp_registrations")
+                old_registrations = cursor.fetchall()
+
+                for user_id, old_class_id, participant_count in old_registrations:
+                    new_class_id = id_mapping[old_class_id]
+                    cursor.execute("""
+                                   INSERT INTO registrations (user_id, class_id, participant_count)
+                                   VALUES (?, ?, ?)
+                                   """, (user_id, new_class_id, participant_count))
+
+                # Удаляем временные таблицы
+                cursor.execute("DROP TABLE temp_classes")
+                cursor.execute("DROP TABLE temp_registrations")
+
+                conn.commit()
+                return True
+
+            except Exception as e:
+                # В случае ошибки откатываем транзакцию
+                conn.rollback()
+                # Пытаемся удалить временные таблицы если они существуют
+                try:
+                    cursor.execute("DROP TABLE IF EXISTS temp_classes")
+                    cursor.execute("DROP TABLE IF EXISTS temp_registrations")
+                except:
+                    pass
+                return False
+
 
 # Инициализация базы данных
 db = DatabaseManager()
@@ -308,6 +408,7 @@ class AdminStates(StatesGroup):
     waiting_class_capacity = State()
     waiting_broadcast_message = State()
     waiting_start_description = State()
+    waiting_reorder_position = State()
 
 
 class BotStates(StatesGroup):
@@ -355,9 +456,10 @@ def get_schedule_keyboard() -> InlineKeyboardMarkup:
     for yoga_class in classes:
         total_registered = db.get_total_participants(yoga_class['id'])
         available = yoga_class['max_participants'] - total_registered
+        text = f"{yoga_class['name']} (нет мест)"
         if available > 0:
             text = f"{yoga_class['name']} (свободно: {available})"
-            buttons.append([InlineKeyboardButton(text=text, callback_data=f"register_{yoga_class['id']}")])
+        buttons.append([InlineKeyboardButton(text=text, callback_data=f"register_{yoga_class['id']}")])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
@@ -382,6 +484,7 @@ def get_admin_schedule_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text="➕ Добавить занятие", callback_data="admin_add_class")],
         [InlineKeyboardButton(text="❌ Удалить занятие", callback_data="admin_delete_class")],
+        [InlineKeyboardButton(text="🔄 Изменить порядок", callback_data="admin_reorder_classes")],
         [InlineKeyboardButton(text="🗑 Удалить расписание", callback_data="admin_delete_schedule")],
         [InlineKeyboardButton(text="📝 Изменить стартовое описание", callback_data="admin_edit_description")],  # Добавить эту строку
         [InlineKeyboardButton(text="📢 Оповестить!", callback_data="admin_broadcast")]
@@ -432,6 +535,178 @@ async def schedule_handler(callback: CallbackQuery):
         await callback.message.edit_text(text, reply_markup=main_keyboard)
 
 
+# 4. Обработчик для показа списка занятий для изменения порядка
+@dp.callback_query(F.data == "admin_reorder_classes")
+async def show_reorder_classes(callback: CallbackQuery):
+    """Показать список занятий для изменения порядка"""
+    await callback.answer()
+
+    # Получаем все занятия
+    classes = db.get_all_yoga_classes()
+
+    if not classes:
+        text = "Нет занятий для изменения порядка."
+        buttons = [[InlineKeyboardButton(text="🔙 Назад", callback_data="admin_manage_schedule")]]
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await callback.message.edit_text(text, reply_markup=keyboard)
+        return
+
+    text = "Какое занятие вы хотите переместить?\n\n<b>Занятия:</b>"
+    buttons = []
+
+    for index, (class_id, class_name, max_participants) in enumerate(classes, 1):
+        button_text = f"#{index} {class_name}"
+        callback_data = f"reorder_class_{class_id}"
+        buttons.append([InlineKeyboardButton(text=button_text, callback_data=callback_data)])
+
+    # Добавляем кнопку "Назад"
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_manage_schedule")])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+# 5. Обработчик выбора занятия для перемещения
+@dp.callback_query(F.data.startswith("reorder_class_"))
+async def select_class_to_reorder(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора занятия для изменения порядка"""
+    await callback.answer()
+
+    try:
+        class_id = int(callback.data.split("_")[2])
+    except (ValueError, IndexError):
+        await callback.message.edit_text(
+            "Ошибка при выборе занятия. Попробуйте еще раз.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_reorder_classes")]
+            ])
+        )
+        return
+
+    # Получаем информацию о занятии
+    classes = db.get_all_yoga_classes()
+    selected_class = None
+    current_position = 0
+
+    for index, (cls_id, cls_name, max_participants) in enumerate(classes, 1):
+        if cls_id == class_id:
+            selected_class = cls_name
+            current_position = index
+            break
+
+    if not selected_class:
+        await callback.message.edit_text(
+            "Занятие не найдено. Попробуйте еще раз.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_reorder_classes")]
+            ])
+        )
+        return
+
+    # Сохраняем данные в состояние
+    await state.update_data(
+        reorder_class_id=class_id,
+        reorder_class_name=selected_class,
+        current_position=current_position,
+        total_classes=len(classes)
+    )
+    await state.set_state(AdminStates.waiting_reorder_position)
+
+    text = (f"Занятие: <b>{selected_class}</b>\n"
+            f"Текущая позиция: <b>#{current_position}</b>\n\n"
+            f"Укажите на какой индекс перенести занятие?\n"
+            f"(от 1 до {len(classes)})")
+
+    buttons = [[InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_reorder")]]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+# 6. Обработчик ввода новой позиции
+@dp.message(StateFilter(AdminStates.waiting_reorder_position))
+async def process_reorder_position(message: Message, state: FSMContext):
+    """Обработка новой позиции для занятия"""
+    try:
+        new_position = int(message.text)
+        if new_position <= 0:
+            raise ValueError("Позиция должна быть положительным числом")
+    except (ValueError, TypeError):
+        data = await state.get_data()
+        total_classes = data.get('total_classes', 1)
+
+        text = (f"Ошибка! Укажите корректный номер позиции.\n"
+                f"Доступные позиции: от 1 до {total_classes}")
+        buttons = [[InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_reorder")]]
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await message.answer(text, reply_markup=keyboard)
+        return
+
+    data = await state.get_data()
+    class_id = data['reorder_class_id']
+    class_name = data['reorder_class_name']
+    current_position = data['current_position']
+    total_classes = data['total_classes']
+
+    # Корректируем позицию (индекс начинается с 0)
+    new_position_index = new_position - 1
+
+    # Если позиция больше общего количества, ставим в конец
+    if new_position > total_classes:
+        new_position_index = total_classes - 1
+        new_position = total_classes
+
+    # Получаем количество регистраций до изменения (для проверки)
+    registrations_before = db.get_total_registrations_count()
+
+    # Обновляем порядок в базе данных
+    success = db.update_class_order(class_id, new_position_index)
+
+    # Получаем количество регистраций после изменения
+    registrations_after = db.get_total_registrations_count()
+
+    await state.clear()
+
+    if success and registrations_before == registrations_after:
+        if new_position != current_position:
+            text = (f"✅ Занятие <b>{class_name}</b> успешно перемещено!\n"
+                    f"Старая позиция: #{current_position}\n"
+                    f"Новая позиция: #{new_position}\n"
+                    f"Все регистрации сохранены ({registrations_after})")
+        else:
+            text = f"Занятие <b>{class_name}</b> осталось на той же позиции #{current_position}"
+    elif success and registrations_before != registrations_after:
+        text = (f"⚠️ Занятие перемещено, но возможна потеря данных регистраций!\n"
+                f"Регистраций до: {registrations_before}, после: {registrations_after}")
+    else:
+        text = f"❌ Ошибка при перемещении занятия <b>{class_name}</b>"
+
+    buttons = [
+        [InlineKeyboardButton(text="🔄 Изменить порядок еще", callback_data="admin_reorder_classes")],
+        [InlineKeyboardButton(text="🗓 Расписание", callback_data="admin_manage_schedule")]
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+# 7. Обработчик отмены изменения порядка
+@dp.callback_query(F.data == "cancel_reorder")
+async def cancel_reorder(callback: CallbackQuery, state: FSMContext):
+    """Отмена изменения порядка"""
+    await callback.answer()
+    await state.clear()
+
+    text = "Изменение порядка отменено."
+    buttons = [
+        [InlineKeyboardButton(text="🔄 Изменить порядок", callback_data="admin_reorder_classes")],
+        [InlineKeyboardButton(text="🗓 Расписание", callback_data="admin_manage_schedule")]
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(text, reply_markup=keyboard)
+
+
 @dp.callback_query(F.data.startswith("register_"))
 async def register_handler(callback: CallbackQuery):
     """Записаться на занятие"""
@@ -449,7 +724,7 @@ async def register_handler(callback: CallbackQuery):
     # Проверяем доступность мест
     total_registered = db.get_total_participants(class_id)
     if total_registered >= yoga_class['max_participants']:
-        await callback.answer("К сожалению, все места заняты!", show_alert=True)
+        await callback.message.answer(f"К сожалению, все места заняты! Пожалуйста свяжитесь с учителем напрямую {TEACHER}, возможно он найдется место 🙏", show_alert=True)
         return
 
     # Записываем пользователя
@@ -670,6 +945,15 @@ async def admin_manage_schedule(callback: CallbackQuery):
         return
 
     text = "Какие изменения в расписании вы хотите сделать?"
+
+    classes = db.get_yoga_classes()
+    if not classes:
+        text = f"{text}\nСейчас нету не одного занятия..."
+    for yoga_class in classes:
+        total_registered = db.get_total_participants(yoga_class['id'])
+        available = yoga_class['max_participants'] - total_registered
+        text = f"{text}\n{yoga_class['name']} (свободно: {available})"
+
     keyboard = get_admin_schedule_keyboard()
     await callback.message.edit_text(text, reply_markup=keyboard)
 

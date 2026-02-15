@@ -11,7 +11,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 
 from dotenv import load_dotenv
 
@@ -229,6 +229,13 @@ class DatabaseManager:
             columns = ['user_id', 'participant_count']
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
+    def clear_class_registrations(self, class_id: int) -> None:
+        """Очистить все записи на конкретное занятие (само занятие не удаляем)"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM registrations WHERE class_id = ?", (class_id,))
+            conn.commit()
+
     def get_all_registrations(self) -> List[Dict]:
         """Получить все записи"""
         with sqlite3.connect(self.db_path) as conn:
@@ -342,14 +349,14 @@ class DatabaseManager:
             try:
                 # Создаем временные таблицы для сохранения данных
                 cursor.execute("""
-                        CREATE TEMPORARY TABLE temp_classes AS 
-                        SELECT * FROM yoga_classes
-                    """)
+                            CREATE TEMPORARY TABLE temp_classes AS 
+                            SELECT * FROM yoga_classes
+                        """)
 
                 cursor.execute("""
-                        CREATE TEMPORARY TABLE temp_registrations AS 
-                        SELECT * FROM registrations
-                    """)
+                            CREATE TEMPORARY TABLE temp_registrations AS 
+                            SELECT * FROM registrations
+                        """)
 
                 # Очищаем основные таблицы
                 cursor.execute("DELETE FROM registrations")
@@ -459,7 +466,7 @@ def get_schedule_keyboard() -> InlineKeyboardMarkup:
         text = f"{yoga_class['name']} (нет мест)"
         if available > 0:
             text = f"{yoga_class['name']} (свободно: {available})"
-        buttons.append([InlineKeyboardButton(text=text, callback_data=f"register_{yoga_class['id']}")])
+        buttons.append([InlineKeyboardButton(text=text, callback_data=f"view_class_{yoga_class['id']}")])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
@@ -527,12 +534,124 @@ async def schedule_handler(callback: CallbackQuery):
     """Показать расписание"""
     keyboard = get_schedule_keyboard()
     if keyboard:
-        text = "На какое занятие вы желаете записаться?\n<b>Текущее расписание:</b>"
+        text = "Выберите занятие:\n<b>Текущее расписание:</b>"
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     else:
         text = "К сожалению нет расписания..."
         main_keyboard = get_main_keyboard(check_admin(callback.from_user))
         await callback.message.edit_text(text, reply_markup=main_keyboard)
+
+
+@dp.callback_query(F.data.startswith("view_class_"))
+async def view_class_handler(callback: CallbackQuery):
+    """Просмотр выбранного занятия (до записи)"""
+    await callback.answer()
+
+    try:
+        class_id = int(callback.data.split("_")[2])
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка: неверный идентификатор занятия", show_alert=True)
+        return
+
+    classes = db.get_yoga_classes()
+    yoga_class = next((c for c in classes if c['id'] == class_id), None)
+    if not yoga_class:
+        await callback.answer("Занятие не найдено!", show_alert=True)
+        return
+
+    total_registered = db.get_total_participants(class_id)
+    available = yoga_class['max_participants'] - total_registered
+    status = "нет мест" if available <= 0 else f"свободно: {available}"
+
+    admin = check_admin(callback.from_user)
+    keyboard = get_class_view_keyboard(class_id, admin)
+
+    text = (
+        f"<b>{yoga_class['name']}</b>\n"
+        f"Мест: {yoga_class['max_participants']}\n"
+        f"Записано: {total_registered}\n"
+        f"Статус: <b>{status}</b>"
+    )
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+def get_class_view_keyboard(class_id: int, admin: bool) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="✅ Записаться", callback_data=f"register_{class_id}")],
+        [InlineKeyboardButton(text="🗓 Расписание", callback_data="schedule")],
+        [InlineKeyboardButton(text="🕰 Моя запись", callback_data="my_registration")],
+    ]
+    if admin:
+        buttons.insert(0, [InlineKeyboardButton(text="👥 Кто записан", callback_data=f"admin_class_who_{class_id}")])
+        buttons.insert(1, [InlineKeyboardButton(text="🧹 Очистить записи", callback_data=f"admin_class_clear_{class_id}")])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.callback_query(F.data.startswith("admin_class_who_"))
+async def admin_class_who_handler(callback: CallbackQuery):
+    """Показать всех записанных на занятие (только админ)"""
+    if not check_admin(callback.from_user):
+        await callback.answer("У вас нет прав доступа!", show_alert=True)
+        return
+
+    try:
+        class_id = int(callback.data.split("_")[3])
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка: неверный идентификатор занятия", show_alert=True)
+        return
+
+    classes = db.get_yoga_classes()
+    yoga_class = next((c for c in classes if c['id'] == class_id), None)
+    if not yoga_class:
+        await callback.answer("Занятие не найдено!", show_alert=True)
+        return
+
+    regs = db.get_class_registrations(class_id)
+    if not regs:
+        text = f"На занятие <b>{yoga_class['name']}</b> пока никто не записан."
+    else:
+        text = f"Кто записан на <b>{yoga_class['name']}</b>:\n\n"
+        for reg in regs:
+            user_id = reg["user_id"]
+            count = reg["participant_count"]
+
+            try:
+                user = await bot.get_chat(user_id)
+                name = user.first_name or f"ID{user_id}"
+                if user.username is not None:
+                    name += f" @{user.username}"
+            except:
+                name = f"ID{user_id}"
+
+            suffix = f" +{count - 1}" if count and count > 1 else ""
+            text += f"• {name}{suffix}\n"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к занятию", callback_data=f"view_class_{class_id}")],
+        [InlineKeyboardButton(text="🗓 Расписание", callback_data="schedule")],
+    ])
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("admin_class_clear_"))
+async def admin_class_clear_handler(callback: CallbackQuery):
+    """Очистить все записи на занятие (только админ), без уведомлений"""
+    if not check_admin(callback.from_user):
+        await callback.answer("У вас нет прав доступа!", show_alert=True)
+        return
+
+    try:
+        class_id = int(callback.data.split("_")[3])
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка: неверный идентификатор занятия", show_alert=True)
+        return
+
+    db.clear_class_registrations(class_id)
+    await callback.answer("Записи очищены", show_alert=False)
+
+    # Возвращаемся на экран занятия (уже с обновлёнными цифрами)
+    await view_class_handler(callback)
 
 
 # 4. Обработчик для показа списка занятий для изменения порядка
@@ -724,7 +843,10 @@ async def register_handler(callback: CallbackQuery):
     # Проверяем доступность мест
     total_registered = db.get_total_participants(class_id)
     if total_registered >= yoga_class['max_participants']:
-        await callback.message.answer(f"К сожалению, все места заняты! Пожалуйста свяжитесь с учителем напрямую {TEACHER}, возможно он найдется место 🙏", show_alert=True)
+        await callback.message.answer(
+            f"К сожалению, все места заняты! Пожалуйста свяжитесь с учителем напрямую {TEACHER}, возможно он найдется место 🙏",
+            show_alert=True
+        )
         return
 
     # Записываем пользователя
